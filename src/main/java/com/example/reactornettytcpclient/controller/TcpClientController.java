@@ -27,7 +27,7 @@ public class TcpClientController {
         String httpEndpoint = (String)param.get("httpEndpoint");
 
 //        tcpClientService.createReadOnlyTcpClient(clientId, host, port, httpEndpoint);
-        tcpClientService.createWriteReadTcpClient(clientId, host, port, httpEndpoint);
+        tcpClientService.createWriteReadMultiTcpClient(clientId, host, port, httpEndpoint);
 
     }
 

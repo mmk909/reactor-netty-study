@@ -12,19 +12,21 @@ import reactor.netty.tcp.TcpClient;
 import java.nio.charset.StandardCharsets;
 
 import reactor.netty.Connection;
+import reactor.util.retry.Retry;
 
 
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
 
 @Service
 public class TcpClientService {
 
     private final List<String> messages = List.of("r", "m", "h");
 
-    private final Map<String, Disposable> activeConnections = new ConcurrentHashMap<>();
+    private final Map<String, Connection> activeConnections = new ConcurrentHashMap<>();
     private final HttpClientService httpClientService;
 
 
@@ -34,7 +36,7 @@ public class TcpClientService {
     }
 
     public void createReadOnlyTcpClient(String clientId, String host, int port, String httpEndpoint) {
-        Disposable conn = TcpClient.create()
+        TcpClient.create()
                 .host(host)
                 .port(port)
                 .handle((inbound, outbound) -> {
@@ -56,22 +58,23 @@ public class TcpClientService {
                 .connect()
                 .doOnSuccess(connection -> {
                     System.out.println("Connected TCP client for " + clientId);
-//                    activeConnections.put(clientId, connection);
+                    activeConnections.put(clientId, connection);
                 })
                 .subscribe();
-        activeConnections.put(clientId, conn);
+//        activeConnections.put(clientId, conn);
     }
 
 
-    public void createWriteReadTcpClient(String clientId, String host, int port, String httpEndpoint) {
+    public Mono<Void> createWriteReadTcpClient(String clientId, String host, int port, String httpEndpoint) {
         destroyTcpClient(clientId);
 
-        Disposable conn = TcpClient.create()
+        return TcpClient.create()
                 .host(host)
                 .port(port)
                 .connect()
                 .doOnSuccess(connection -> {
                     System.out.println("Connected TCP client for " + clientId);
+                    activeConnections.put(clientId, connection);
                 })
                 .flatMapMany(connection -> {
                     // Create a Flux to periodically send messages
@@ -97,15 +100,104 @@ public class TcpClientService {
                             });
                 })
                 .doOnNext(response -> System.out.println("Received: " + response))
+                .then();
+//        activeConnections.put(clientId, conn);
+    }
+
+    private static boolean isRetryableError(Throwable throwable) {
+        return throwable instanceof Exception;  // Customize as per your error handling needs
+    }
+
+    public void createWriteReadMultiTcpClient(String clientId, String host, int port, String httpEndpoint) {
+        Retry retrySpec = Retry.backoff(Long.MAX_VALUE, Duration.ofSeconds(2))
+                .filter(throwable -> isRetryableError(throwable));
+        Mono<Void> connectionMono = Mono.defer(()-> {
+                  return  _createWriteReadMultiTcpClient(clientId,host,port,httpEndpoint);
+        });
+        connectionMono.retryWhen(retrySpec)
                 .subscribe();
-        activeConnections.put(clientId, conn);
+
+    }
+
+    public Mono<Void> _createWriteReadMultiTcpClient(String clientId, String host, int port, String httpEndpoint) {
+        destroyTcpClient(clientId);
+
+
+        return TcpClient.create()
+                .host(host)
+                .port(port)
+                .doOnDisconnected(connection -> {
+                    Disposable disposable = activeConnections.get(clientId);
+                    if (disposable != null) {
+                        System.out.println("error happened!");
+                        activeConnections.remove(clientId);
+                        disposable.dispose();
+                        createWriteReadMultiTcpClient(clientId,host,port,httpEndpoint);
+                    }
+                })
+                .connect()
+                .doOnSuccess(connection -> {
+                    System.out.println("Connected TCP client for " + clientId);
+                    activeConnections.put(clientId, connection);
+
+                })
+//                .onErrorResume(error->{
+//                    System.out.println(error);
+//                    return null;
+//                })
+//                .doOnError(error -> {
+//                    System.err.println("Connection failed: " + error);
+//                    // Retry the connection on error
+//                    System.out.println("Attempting to reconnect...");
+//                })
+                .flatMapMany(connection -> {
+                    // Create a Flux to periodically send messages
+                    Flux<String> periodicWrites = Flux.interval(Duration.ofSeconds(3))
+                            .flatMap(tick -> {
+                                List<Mono<String>> list = messages.stream().map(cmd -> {
+                                    return connection.outbound().sendString(Mono.just(cmd)).then().onErrorResume(error->{
+                                        System.out.println(error);
+                                        return null;
+                                    }).doOnError(error-> System.out.println(error)).then(Mono.delay(Duration.ofMillis(200))).then(Mono.just(cmd));
+                                }).collect(Collectors.toList());
+                                return Flux.concat(list).delayElements(Duration.ofMillis(200));
+                            })
+                            .doOnCancel(() -> System.out.println("Periodic writes canceled"));
+
+                    // Read responses from the server
+                    Flux<String> responses = connection.inbound().receive().asString().onErrorResume(error->{
+                        System.out.println(error);
+                        return null;
+                    }).doOnError(error-> System.out.println(error));
+
+                    // Merge the periodic writes and responses
+                    return periodicWrites.zipWith(responses,(a,b)-> a + ":" + b)
+                            .onErrorResume(error->{
+                                System.out.println(error);
+                                return null;
+                            })
+                            .doOnError(error->{
+                                System.out.println(error);
+                            })
+                            .doFinally(signalType -> {
+                                if (signalType == SignalType.CANCEL) {
+                                    System.out.println("Connection was canceled, stopping periodic writes.");
+                                } else if (signalType == SignalType.ON_COMPLETE) {
+                                    System.out.println("Connection completed normally.");
+                                } else if (signalType == SignalType.ON_ERROR) {
+                                    System.out.println("Connection encountered an error.");
+                                }
+                            });
+                })
+                .doOnNext(response -> System.out.println("Received: " + response))
+                .then();
     }
 
     public void destroyTcpClient(String clientId) {
-        Disposable connection = activeConnections.get(clientId);
+        Connection connection = activeConnections.get(clientId);
         if (connection != null) {
-            connection.dispose();
             activeConnections.remove(clientId);
+            connection.dispose();
             System.out.println("Disconnected TCP client for " + clientId);
         }
     }
