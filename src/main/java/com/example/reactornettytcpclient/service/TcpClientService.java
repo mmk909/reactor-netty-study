@@ -27,6 +27,8 @@ public class TcpClientService {
     private final List<String> messages = List.of("r", "m", "h");
 
     private final Map<String, Connection> activeConnections = new ConcurrentHashMap<>();
+    private final Map<String, Disposable> activeRetryMonos = new ConcurrentHashMap<>();
+
     private final HttpClientService httpClientService;
 
 
@@ -127,11 +129,11 @@ public class TcpClientService {
                 .host(host)
                 .port(port)
                 .doOnDisconnected(connection -> {
-                    Disposable disposable = activeConnections.get(clientId);
-                    if (disposable != null) {
+                    Connection exist_conn = activeConnections.get(clientId);
+                    if (exist_conn != null) {
                         System.out.println("error happened!");
                         activeConnections.remove(clientId);
-                        disposable.dispose();
+                        exist_conn.dispose();
                         createWriteReadMultiTcpClient(clientId,host,port,httpEndpoint);
                     }
                 })
@@ -193,13 +195,94 @@ public class TcpClientService {
                 .then();
     }
 
+    public void createReadWriteMultiTcpClient(String clientId, String host, int port, String httpEndpoint) {
+        Retry retrySpec = Retry.backoff(Long.MAX_VALUE, Duration.ofSeconds(1))
+                .maxBackoff(Duration.ofSeconds(60))
+                .filter(throwable -> isRetryableError(throwable))
+                .doBeforeRetry(retrySignal -> {
+                    System.out.println("Retrying due to: " + retrySignal.failure().getMessage());
+                    System.out.println("Retry attempt: " + retrySignal.totalRetries() + ", delay: " + retrySignal.totalRetriesInARow());
+                });
+        Mono<Void> connectionMono = Mono.defer(()-> {
+            return  _createReadWriteMultiTcpClient(clientId,host,port,httpEndpoint);
+        });
+        Disposable disposable = connectionMono.retryWhen(retrySpec)
+                .doOnSubscribe(subscription -> System.out.println("Subscription started for clientId: " + clientId))
+                .doOnSuccess(aVoid -> System.out.println("Connection successful for clientId: " + clientId))
+                .doOnError(error -> System.out.println("Connection failed for clientId: " + clientId + " with error: " + error.getMessage()))
+                .doFinally(signalType -> System.out.println("retry final:" + signalType))
+                .subscribe();
+        activeRetryMonos.put(clientId, disposable);
+
+    }
+
+    public Mono<Void> _createReadWriteMultiTcpClient(String clientId, String host, int port, String httpEndpoint) {
+        destroyTcpClient(clientId);
+
+
+        return TcpClient.create()
+                .host(host)
+                .port(port)
+                .doOnDisconnected(connection -> {
+                    Connection exist_conn = activeConnections.get(clientId);
+                    if (exist_conn != null) {
+                        System.out.println("error happened!");
+                        activeConnections.remove(clientId);
+                        exist_conn.dispose();
+                        createReadWriteMultiTcpClient(clientId,host,port,httpEndpoint);
+                    }
+                })
+                .handle((in, out) -> {
+                    Flux<Void> responses = in.receive()
+                            .asString()
+                            .map(message -> {
+                                System.out.println("Received message: " + message);
+
+                                // Process message and prepare response
+                                String response;
+                                if ("Hello".equals(message)) {
+                                    response = "Hello, server!";
+                                } else if ("How are you?".equals(message)) {
+                                    response = "I'm fine, thank you!";
+                                } else {
+                                    response = "Sorry, I didn't understand.";
+                                }
+
+                                return response;
+                            })
+                            .flatMap(response -> out.sendString(Flux.just(response)));
+
+                    return responses;
+                })
+                .connect()
+                .doOnSuccess(connection -> {
+                    System.out.println("Connected TCP client for " + clientId);
+                    activeConnections.put(clientId, connection);
+
+                })
+                .doOnNext(response -> System.out.println("Received: " + response))
+                .then();
+    }
+
+    public void destroyTcpClientRetry(String clientId) {
+        Disposable disposable = activeRetryMonos.get(clientId);
+        if (disposable != null) {
+            activeRetryMonos.remove(clientId);
+            disposable.dispose();
+            System.out.println("Disconnected TCP client for " + clientId);
+        }
+    }
+
     public void destroyTcpClient(String clientId) {
+
         Connection connection = activeConnections.get(clientId);
         if (connection != null) {
             activeConnections.remove(clientId);
             connection.dispose();
             System.out.println("Disconnected TCP client for " + clientId);
         }
+
+
     }
 
     @PreDestroy

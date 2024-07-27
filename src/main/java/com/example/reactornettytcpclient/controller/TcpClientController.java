@@ -27,12 +27,15 @@ public class TcpClientController {
         String httpEndpoint = (String)param.get("httpEndpoint");
 
 //        tcpClientService.createReadOnlyTcpClient(clientId, host, port, httpEndpoint);
-        tcpClientService.createWriteReadMultiTcpClient(clientId, host, port, httpEndpoint);
+//        tcpClientService.createWriteReadMultiTcpClient(clientId, host, port, httpEndpoint);
+        tcpClientService.createReadWriteMultiTcpClient(clientId, host, port, httpEndpoint);
+
 
     }
 
     @DeleteMapping("/{clientId}")
     public void destroyTcpClient(@PathVariable String clientId) {
+        tcpClientService.destroyTcpClientRetry(clientId);
         tcpClientService.destroyTcpClient(clientId);
     }
 
